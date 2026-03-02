@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: bun-linux-x64
+            artifact: todoai-tui-linux-x64
+          - os: macos-14
+            target: bun-darwin-arm64
+            artifact: todoai-tui-darwin-arm64
+          - os: macos-13
+            target: bun-darwin-x64
+            artifact: todoai-tui-darwin-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: tui
+
+    - uses: actions/checkout@v4
+      with:
+        repository: todoforai/cli
+        path: cli
+
+    - uses: actions/checkout@v4
+      with:
+        repository: todoforai/edge
+        path: edge
+
+    # Repo layout: tui/, cli/, edge/ — matching the local file: deps
+    # Adjust package.json paths for CI layout
+    - name: Fix local dep paths for CI
+      run: |
+        cd tui
+        sed -i.bak 's|"file:../cli"|"file:../cli"|' package.json
+        sed -i.bak 's|"file:../edge/bun"|"file:../edge/bun"|' package.json
+        rm -f package.json.bak
+
+    - uses: oven-sh/setup-bun@v2
+
+    - name: Install dependencies
+      run: cd tui && bun install --ignore-scripts
+
+    - name: Type check
+      run: cd tui && bunx tsc --noEmit
+
+    - name: Build standalone binary
+      run: |
+        cd tui
+        bun build src/index.ts --compile --target=${{ matrix.target }} --outfile ${{ matrix.artifact }}
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: tui/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: artifacts/*
+        generate_release_notes: true
