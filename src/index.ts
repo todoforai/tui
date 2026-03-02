@@ -417,25 +417,13 @@ class TuiApp {
 
       // ── Pre-resolve agent (always try path, like CLI) ──
       let preMatchedAgent: any = null;
-      let agents: any[] = [];
 
       if (args.agent) {
-        // Try filtered endpoint, fall back to full list + client-side match
-        let agentMatches: any[] | null = null;
-        try {
-          agentMatches = await this.api.listAgentSettings({ name: args.agent as string });
-        } catch {
-          agents = await this.api.listAgentSettings();
-          const name = (args.agent as string).toLowerCase();
-          const found = agents.find((a: any) => getDisplayName(a).toLowerCase().includes(name));
-          if (found) agentMatches = [found];
-        }
-        if (agentMatches && agentMatches.length > 0) {
-          preMatchedAgent = agentMatches[0];
+        const matches = await this.api.listAgentSettings({ name: args.agent as string });
+        if (matches.length > 0) {
+          preMatchedAgent = matches[0];
         } else {
-          if (!agents.length) agents = await this.api.listAgentSettings();
           this.output.appendLine(`${RED}Error: Agent '${args.agent}' not found${RESET}`);
-          for (const a of agents) this.output.appendLine(`  - ${getDisplayName(a)}`);
           this.output.render();
           await this.waitForExit();
           return;
@@ -445,25 +433,15 @@ class TuiApp {
         // Always resolve from --path (defaults to "."/cwd), same as CLI
         const pathArg = (args.path as string) || ".";
         const resolved = realpathSync(resolve(pathArg));
-        // Try filtered endpoint, fall back to full list + client-side match
-        let matches: any[] | null = null;
-        try {
-          matches = await this.api.listAgentSettings({ workspacePath: resolved });
-        } catch {
-          const { findAgentByPath } = await import("todoforai-cli/src/agent");
-          agents = await this.api.listAgentSettings();
-          const found = findAgentByPath(agents, pathArg);
-          if (found) matches = [found];
-        }
-        if (matches && matches.length > 0) {
+        const matches = await this.api.listAgentSettings({ workspacePath: resolved });
+        if (matches.length > 0) {
           preMatchedAgent = matches[0];
           this.cfg.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
         } else if (pathArg !== ".") {
           // Explicit non-cwd path with no match — auto-create
           this.output.appendLine(`${DIM}No agent for '${formatPathWithTilde(resolved)}', creating...${RESET}`);
           this.output.render();
-          if (!agents.length) agents = await this.api.listAgentSettings();
-          preMatchedAgent = await autoCreateAgent(this.api, resolved, agents);
+          preMatchedAgent = await autoCreateAgent(this.api, resolved);
           this.cfg.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
         }
       }
@@ -510,9 +488,10 @@ class TuiApp {
       const hasAgent = preMatchedAgent || (storedAgent?.id && !args.agent);
 
       let projects: any[] | null = null;
+      let agents: any[] = [];
       if (!hasProject || !hasAgent) {
         projects = await this.api.listProjects();
-        if (!agents.length) agents = await this.api.listAgentSettings();
+        if (!hasAgent) agents = await this.api.listAgentSettings();
       }
 
       // Project
