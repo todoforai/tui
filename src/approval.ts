@@ -4,8 +4,7 @@
  */
 
 import { FrontendWebSocket } from "todoforai-edge/src/frontend-ws";
-import { getBlockPatterns } from "@shared/fbe/bashPatterns";
-import { getNewPatterns } from "@shared/fbe/permissionUtils";
+import { getBlockNewPatterns } from "@shared/fbe/permissionUtils";
 import { renderDiff } from "todoforai-cli/src/diff-view";
 import { OutputBuffer } from "./output";
 import { YELLOW, GREEN, RED, DIM, CYAN, RESET } from "./colors";
@@ -102,12 +101,11 @@ export async function handleApprovalPrompt(
     }
   }
 
-  const allPatterns = blocks.flatMap(bi => getBlockPatterns({
+  const newPatterns = blocks.flatMap(bi => getBlockNewPatterns({
     type: bi.block_type || "unknown",
     generalized_pattern: bi.generalized_pattern,
     cmd: bi.cmd,
-  }));
-  const newPatterns = getNewPatterns(allPatterns, ctx.agentSettings?.permissions);
+  }, ctx.agentSettings?.permissions));
   const stripPrefix = (p: string) => p.replace(/^todoai_(edge|cloud):/, "");
   const patternHint = newPatterns.length ? ` ${DIM}${newPatterns.map(stripPrefix).join(", ")}${RESET}` : "";
 
@@ -123,11 +121,11 @@ export async function handleApprovalPrompt(
       for (const bi of blocks) {
         let patterns: string[] | undefined;
         if (response === "r") {
-          patterns = getBlockPatterns({
+          patterns = getBlockNewPatterns({
             type: bi.block_type || "unknown",
             generalized_pattern: bi.generalized_pattern,
             cmd: bi.cmd,
-          });
+          }, ctx.agentSettings?.permissions);
           if (patterns.length) {
             ctx.output.appendLine(`  ${GREEN}✓ Remembering: ${patterns.map(stripPrefix).join(", ")}${RESET}`);
           }
