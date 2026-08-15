@@ -139,10 +139,12 @@ export async function handleApprovalPrompt(
       ctx.output.appendLine(`  ${RED}✗ Denied${RESET}`);
     }
   } catch {
-    // Interrupted — auto-approve
+    // Interrupted or read failed — deny. Approving here would let a Ctrl+C
+    // (or any stdin error) silently grant whatever the agent asked for.
     for (const bi of blocks) {
-      sendApproval(ctx.ws, bi.blockId, bi.messageId, ctx.todoId);
+      ctx.ws.sendBlockDeny(ctx.todoId, bi.messageId, bi.blockId);
     }
+    ctx.output.appendLine(`  ${RED}✗ Denied (interrupted)${RESET}`);
   }
   ctx.output.render(true);
 }
