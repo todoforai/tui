@@ -24,6 +24,7 @@ import type { CliRenderer } from "@opentui/core";
 import { OutputBuffer } from "./output";
 import { StatusBar } from "./status-bar";
 import { InputBar } from "./input-bar";
+import { decodeSingleChar } from "./keys";
 import { watchTodo } from "./watch";
 import { CYAN, DIM, GREEN, RED, RESET } from "./colors";
 
@@ -160,13 +161,8 @@ class TuiApp {
       // whereas a pending promise would leave it neither approved nor denied.
       const onEnd = () => done(() => reject(new Error("stdin closed")));
       const handler = (seq: string) => {
-        // Skip multi-char escape sequences (arrows, F-keys, etc.)
-        if (seq.length > 1 && seq.startsWith("\x1b")) return false;
-        // Enter = accept the default. Every other control key (Ctrl+C, Ctrl+D,
-        // ESC) must NOT: callers treat "" as approval, so mapping them to ""
-        // would make an interrupt silently allow the action. Return the raw
-        // char instead — it matches no choice and therefore denies.
-        const ch = seq === "\r" || seq === "\n" ? "" : seq[0].toLowerCase();
+        const ch = decodeSingleChar(seq);
+        if (ch === null) return false; // not a decision — keep waiting
         done(() => resolve(ch));
         return true;
       };

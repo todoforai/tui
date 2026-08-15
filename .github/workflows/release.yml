@@ -44,6 +44,9 @@ jobs:
     - name: Type check
       run: cd tui && bunx tsc --noEmit
 
+    - name: Test
+      run: cd tui && bun test
+
     - name: Build standalone binary
       run: |
         cd tui
