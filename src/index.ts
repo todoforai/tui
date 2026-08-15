@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * TODOforAI TUI — full-screen terminal interface
+ * TODOforAI TUI — full-screen terminal interface powered by OpenTUI
  * Usage: todoai-tui "prompt text" | todoai-tui --resume <id> | todoai-tui -c
  */
 
@@ -8,36 +8,30 @@ import { realpathSync } from "fs";
 import { resolve } from "path";
 import { homedir } from "os";
 
-import { ApiClient } from "todoforai-edge/src/api";
-import { FrontendWebSocket } from "todoforai-edge/src/frontend-ws";
-import { normalizeApiUrl } from "todoforai-edge/src/config";
+import { ApiClient, FrontendWebSocket } from "@shared/api";
+import { normalizeApiUrl, readCredential } from "@shared/credentials";
 
 import { DEFAULT_API_URL, getEnv, parseCliArgs } from "todoforai-cli/src/args";
-import { ConfigStore } from "todoforai-cli/src/config";
+import { ConfigStore, ScopedConfig } from "todoforai-cli/src/config";
 import { getAgentWorkspacePaths, autoCreateAgent } from "todoforai-cli/src/agent";
 import { getDisplayName, getItemId } from "todoforai-cli/src/select";
 import { randomTip } from "todoforai-cli/src/tips";
+import { getFrontendUrl } from "todoforai-cli/src/urls";
 import { renderLogo } from "./logo";
 
-import { Screen } from "./screen";
+import { createCliRenderer, BoxRenderable } from "@opentui/core";
+import type { CliRenderer } from "@opentui/core";
 import { OutputBuffer } from "./output";
 import { StatusBar } from "./status-bar";
 import { InputBar } from "./input-bar";
 import { watchTodo } from "./watch";
-import { BRAND, BRIGHT_WHITE, CYAN, DIM, GREEN, RED, RESET, YELLOW } from "./colors";
+import { CYAN, DIM, GREEN, RED, RESET } from "./colors";
 
 // ── helpers ──
 
 function formatPathWithTilde(path: string): string {
   const home = homedir();
   return path.startsWith(home) ? path.replace(home, "~") : path;
-}
-
-function getFrontendUrl(apiUrl: string, projectId: string, todoId: string): string {
-  if (apiUrl.includes("localhost:4000") || apiUrl.includes("127.0.0.1:4000")) {
-    return `http://localhost:3000/${projectId}/${todoId}`;
-  }
-  return `https://todofor.ai/${projectId}/${todoId}`;
 }
 
 function printUsage(): void {
@@ -53,6 +47,7 @@ Options:
   --path <dir>             Workspace path (default: cwd)
   --project <id>           Project ID
   --agent, -a <name>       Agent name (partial match)
+  --model, -m <model>      Override agent model
   --api-url <url>          API URL
   --api-key <key>          API key
   --resume, -r [todo-id]   Resume existing todo
@@ -61,9 +56,6 @@ Options:
   --safe                   Validate API key upfront
   --debug, -d              Debug output
   --show-config            Show config
-  --set-defaults           Interactive defaults setup
-  --set-default-api-url    Set default API URL
-  --set-default-api-key    Set default API key
   --reset-config           Reset config file
   --help, -h               Show this help
 
@@ -73,97 +65,129 @@ Key bindings:
   PgUp/PgDn     Scroll output
   Ctrl+C        Interrupt / exit
   Ctrl+D        Exit
-  Ctrl+L        Force redraw
 `);
+}
+
+// ── Clipboard ──
+
+async function readClipboard(): Promise<string> {
+  if (process.platform === "darwin") {
+    try {
+      const proc = Bun.spawn(["pbpaste"], { stdout: "pipe", stderr: "pipe" });
+      const text = await new Response(proc.stdout).text();
+      await proc.exited;
+      return text;
+    } catch { return ""; }
+  }
+  if (process.env.WAYLAND_DISPLAY) {
+    try {
+      const proc = Bun.spawn(["wl-paste", "--no-newline"], { stdout: "pipe", stderr: "pipe" });
+      const text = await new Response(proc.stdout).text();
+      await proc.exited;
+      return text;
+    } catch { return ""; }
+  }
+  // X11: try xclip, fall back to xsel
+  for (const cmd of [
+    ["xclip", "-selection", "clipboard", "-o"],
+    ["xsel", "--clipboard", "--output"],
+  ]) {
+    try {
+      const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+      const text = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      if (code === 0) return text;
+    } catch { continue; }
+  }
+  return "";
 }
 
 // ── TUI App ──
 
 class TuiApp {
-  private screen = new Screen();
-  private output: OutputBuffer;
-  private status: StatusBar;
-  private input: InputBar;
+  private renderer: CliRenderer | null = null;
+  private output: OutputBuffer | null = null;
+  private status: StatusBar | null = null;
+  private input: InputBar | null = null;
   private ws: FrontendWebSocket | null = null;
   private api: ApiClient | null = null;
   private cfg: ConfigStore | null = null;
+  private cfgScope: ScopedConfig | null = null;
   private apiUrl = "";
   private todoId = "";
   private projectId = "";
   private agent: any = null;
   private running = true;
 
-  constructor() {
-    this.output = new OutputBuffer(this.screen);
-    this.status = new StatusBar(this.screen);
-    this.input = new InputBar(this.screen);
-    this.input.onFullRedraw = () => this.redraw();
-  }
-
-  /** Full redraw of all regions */
-  private redraw(): void {
-    this.status.render();
-    this.output.render(true);
-    if (this.input.enabled) {
-      this.input.render();
-    } else {
-      this.input.renderDisabled();
-    }
-  }
-
-  /** Set up resize handler */
-  private setupResize(): void {
-    process.stdout.on("resize", () => {
-      this.screen.measure();
-      this.redraw();
+  private setupGlobalKeys(): void {
+    // prependInputHandler runs before focused renderables — essential for scroll to work
+    // even when InputRenderable has focus.
+    this.renderer!.prependInputHandler((seq) => {
+      if (seq === "\x1b[5~") { this.output!.scrollUp(); return true; }   // PgUp
+      if (seq === "\x1b[6~") { this.output!.scrollDown(); return true; } // PgDn
+      if (seq === "\x0c") { return true; }                               // Ctrl+L no-op
+      if (seq === "\x04") { this.cleanup(); process.exit(0); }           // Ctrl+D
+      if (seq === "\x03") {
+        if (this.status?.watching) {
+          // During watch: fire SIGINT so watch.ts handler sends interrupt
+          process.kill(process.pid, "SIGINT");
+        } else {
+          // During input: cancel + exit
+          this.input?.triggerCancel?.();
+          setTimeout(() => { this.cleanup(); process.exit(0); }, 50);
+        }
+        return true;
+      }
+      // Ctrl+V: read system clipboard and insert into input field
+      if (seq === "\x16") {
+        readClipboard().then(text => { if (text) this.input?.insertText(text); });
+        return true;
+      }
+      return false;
     });
   }
 
-  /** Set up global key handler for PgUp/PgDn/Ctrl+L when input is not active */
-  private setupGlobalKeys(): void {
-    // We handle PgUp/PgDn in a raw-mode listener that runs alongside input
-    const origStdin = process.stdin;
-    // Global key handling is done via a pre-filter in the input data handler
-  }
-
   /** Read a single char for approval prompts */
-  private singleChar(prompt: string): Promise<string> {
-    return new Promise((resolve) => {
-      const wasRaw = process.stdin.isRaw;
-      if (process.stdin.isTTY) process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.once("data", (buf) => {
-        if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
-        process.stdin.pause();
-        const ch = buf.toString("utf-8").trim();
-        const decoded = ch === "" || ch === "\r" || ch === "\n" ? "" : ch[0].toLowerCase();
-        resolve(decoded);
-      });
+  private singleChar(_prompt: string): Promise<string> {
+    return new Promise(resolve => {
+      const handler = (seq: string) => {
+        // Skip multi-char escape sequences (arrows, F-keys, etc.)
+        if (seq.length > 1 && seq.startsWith("\x1b")) return false;
+        this.renderer!.removeInputHandler(handler);
+        // Enter = accept the default. Every other control key (Ctrl+C, Ctrl+D,
+        // ESC) must NOT: callers treat "" as approval, so mapping them to ""
+        // would make an interrupt silently allow the action. Return the raw
+        // char instead — it matches no choice and therefore denies.
+        if (seq === "\r" || seq === "\n") { resolve(""); return true; }
+        resolve(seq[0].toLowerCase());
+        return true;
+      };
+      this.renderer!.prependInputHandler(handler);
     });
   }
 
   /** Watch a todo, rendering to output buffer */
   private async watch(replayMessages?: Array<[string, any]>): Promise<boolean> {
     if (!this.ws) return false;
-    this.status.watching = true;
-    this.status.render();
-    this.input.renderDisabled(`${DIM}  AI is working... (Ctrl+C to interrupt)${RESET}`);
+    this.status!.watching = true;
+    this.status!.render();
+    this.input!.renderDisabled(`${DIM}  AI is working… (Ctrl+C to interrupt)${RESET}`);
 
     const result = await watchTodo(
-      this.ws, this.todoId, this.projectId, this.output,
+      this.ws, this.todoId, this.projectId, this.output!,
       {
         agentSettings: this.agent,
         replayMessages,
         singleCharFn: (prompt) => this.singleChar(prompt),
         onRender: () => {
-          this.output.render();
-          this.status.render();
+          this.output!.render();
+          this.status!.render();
         },
       },
     );
 
-    this.status.watching = false;
-    this.status.render();
+    this.status!.watching = false;
+    this.status!.render();
     return result;
   }
 
@@ -171,7 +195,6 @@ class TuiApp {
   private async interactiveLoop(): Promise<void> {
     while (this.running) {
       try {
-        // Set up activity detection on WS
         let activityResolve: (() => void) | null = null;
         const activityPromise = new Promise<void>((res) => { activityResolve = res; });
 
@@ -186,57 +209,39 @@ class TuiApp {
           if (!ignoreActivity.has(msgType)) activityResolve?.();
         });
 
-        this.input.renderDisabled();
-        // Small delay to let the screen settle
+        this.input!.renderDisabled();
         await new Promise(r => setTimeout(r, 50));
-        this.redraw();
+        this.status!.render();
 
-        const { promise: inputPromise, cancel: cancelInput } = this.input.read();
-
-        // Set up PgUp/PgDn listener while input is active
-        const pgHandler = (data: Buffer) => {
-          const s = data.toString("utf-8");
-          // PgUp: \x1b[5~  PgDn: \x1b[6~
-          if (s === "\x1b[5~") { this.output.scrollUp(); this.output.render(); }
-          else if (s === "\x1b[6~") { this.output.scrollDown(); this.output.render(); }
-          // Ctrl+L: force redraw
-          else if (s === "\x0c") { this.redraw(); }
-        };
-        process.stdin.on("data", pgHandler);
+        const { promise: inputPromise, cancel: cancelInput } = this.input!.read();
 
         const winner = await Promise.race([
           inputPromise.then(v => ({ tag: "input" as const, value: v })),
           activityPromise.then(() => ({ tag: "activity" as const, value: "" })),
         ]);
 
-        process.stdin.removeListener("data", pgHandler);
-
         if (winner.tag === "activity") {
           cancelInput();
           inputPromise.catch(() => {});
-          this.output.scrollToBottom();
+          this.output!.scrollToBottom();
           await this.watch(buffered);
           continue;
         }
 
-        // User input
         this.ws!.setCallback(this.todoId);
         const text = winner.value;
         if (!text) continue;
         if (["/exit", "/quit", "/q", "q", "exit"].includes(text)) break;
         if (["/help", "?"].includes(text)) {
-          this.output.appendLine(`${DIM}  /exit, /quit, /q  - quit${RESET}`);
-          this.output.appendLine(`${DIM}  /help, ?          - show help${RESET}`);
-          this.output.appendLine(`${DIM}  PgUp/PgDn         - scroll output${RESET}`);
-          this.output.appendLine(`${DIM}  Alt+Enter          - newline in input${RESET}`);
-          this.output.render();
+          this.output!.appendLine(`${DIM}  /exit, /quit  - quit${RESET}`);
+          this.output!.appendLine(`${DIM}  /help, ?      - show help${RESET}`);
+          this.output!.appendLine(`${DIM}  PgUp/PgDn     - scroll output${RESET}`);
           continue;
         }
 
-        this.output.appendLine(`\n${DIM}${"─".repeat(40)}${RESET}`);
-        this.output.appendLine(`${CYAN}You:${RESET} ${text}`);
-        this.output.scrollToBottom();
-        this.output.render();
+        this.output!.appendLine(`\n${DIM}${"─".repeat(40)}${RESET}`);
+        this.output!.appendLine(`${CYAN}You:${RESET} ${text}`);
+        this.output!.scrollToBottom();
 
         await this.api!.addMessage(this.projectId, text, this.agent, this.todoId);
         await this.watch();
@@ -246,41 +251,39 @@ class TuiApp {
     }
   }
 
-  /** Select project (auto/default/interactive via output area) */
+  /** Select project (auto/default/interactive) */
   private async selectProject(projects: any[]): Promise<{ id: string; name: string }> {
     if (!projects?.length) throw new Error("No projects available");
 
     if (projects.length === 1) {
       const id = getItemId(projects[0]);
       const name = getDisplayName(projects[0]);
-      this.output.appendLine(`${DIM}Auto-selected project: ${name}${RESET}`);
+      this.output!.appendLine(`${DIM}Auto-selected project: ${name}${RESET}`);
       return { id, name };
     }
 
-    if (this.cfg!.data.default_project_id) {
-      const match = projects.find(p => getItemId(p) === this.cfg!.data.default_project_id);
+    if (this.cfgScope!.data.default_project_id) {
+      const match = projects.find(p => getItemId(p) === this.cfgScope!.data.default_project_id);
       if (match) {
         const name = getDisplayName(match);
-        this.output.appendLine(`${DIM}Using default project: ${name}${RESET}`);
-        return { id: this.cfg!.data.default_project_id, name };
+        this.output!.appendLine(`${DIM}Using default project: ${name}${RESET}`);
+        return { id: this.cfgScope!.data.default_project_id, name };
       }
     }
 
-    this.output.appendLine(`\n${BRIGHT_WHITE}Choose a project:${RESET}`);
+    this.output!.appendLine(`\nChoose a project:`);
     for (let i = 0; i < projects.length; i++) {
-      this.output.appendLine(` ${BRAND}[${i + 1}]${RESET} ${getDisplayName(projects[i])}`);
+      this.output!.appendLine(` [${i + 1}] ${getDisplayName(projects[i])}`);
     }
-    this.output.render(true);
 
     const ch = await this.singleChar("project");
     const idx = parseInt(ch, 10) - 1;
     if (idx >= 0 && idx < projects.length) {
       const id = getItemId(projects[idx]);
       const name = getDisplayName(projects[idx]);
-      this.cfg!.setDefaultProject(id, name);
+      this.cfgScope!.setDefaultProject(id, name);
       return { id, name };
     }
-    // Default to first
     return { id: getItemId(projects[0]), name: getDisplayName(projects[0]) };
   }
 
@@ -289,33 +292,32 @@ class TuiApp {
     if (!agents?.length) throw new Error("No agents available");
 
     if (agents.length === 1) {
-      this.output.appendLine(`${DIM}Auto-selected agent: ${getDisplayName(agents[0])}${RESET}`);
+      this.output!.appendLine(`${DIM}Auto-selected agent: ${getDisplayName(agents[0])}${RESET}`);
       return agents[0];
     }
 
-    const defaultName = this.cfg!.data.default_agent_name;
+    const defaultName = this.cfgScope!.data.default_agent_name;
     if (defaultName) {
       const match = agents.find(a =>
         defaultName.toLowerCase().includes(getDisplayName(a).toLowerCase()) ||
         getDisplayName(a).toLowerCase().includes(defaultName.toLowerCase()),
       );
       if (match) {
-        this.output.appendLine(`${DIM}Using default agent: ${getDisplayName(match)}${RESET}`);
+        this.output!.appendLine(`${DIM}Using default agent: ${getDisplayName(match)}${RESET}`);
         return match;
       }
     }
 
-    this.output.appendLine(`\n${BRIGHT_WHITE}Choose an agent:${RESET}`);
+    this.output!.appendLine(`\nChoose an agent:`);
     for (let i = 0; i < agents.length; i++) {
-      this.output.appendLine(` ${BRAND}[${i + 1}]${RESET} ${getDisplayName(agents[i])}`);
+      this.output!.appendLine(` [${i + 1}] ${getDisplayName(agents[i])}`);
     }
-    this.output.render(true);
 
     const ch = await this.singleChar("agent");
     const idx = parseInt(ch, 10) - 1;
     if (idx >= 0 && idx < agents.length) {
       const agent = agents[idx];
-      this.cfg!.setDefaultAgent(getDisplayName(agent), agent);
+      this.cfgScope!.setDefaultAgent(getDisplayName(agent), agent);
       return agent;
     }
     return agents[0];
@@ -328,7 +330,6 @@ class TuiApp {
 
     this.cfg = new ConfigStore(args["config-path"] as string);
 
-    // Config subcommands — don't need TUI
     if (args["show-config"]) {
       console.log(`Config file: ${formatPathWithTilde(this.cfg.path)}`);
       console.log(JSON.stringify(this.cfg.data, null, 2));
@@ -341,36 +342,50 @@ class TuiApp {
       return;
     }
 
-    // Resolve API
     this.apiUrl = normalizeApiUrl(
-      (args["api-url"] as string) || this.cfg.data.default_api_url || getEnv("API_URL") || DEFAULT_API_URL,
+      (args["api-url"] as string) || getEnv("API_URL") || DEFAULT_API_URL,
     );
-    const apiKey = (args["api-key"] as string) || this.cfg.data.default_api_key || getEnv("API_KEY") || "";
+    this.cfgScope = this.cfg.scope(this.apiUrl);
+    // Same priority as the CLI: flag > shared credentials.json > env token.
+    const apiKey = (args["api-key"] as string) || readCredential(this.apiUrl) || getEnv("API_TOKEN") || "";
     if (!apiKey) {
-      console.error("Error: No API key. Set via --api-key, TODOFORAI_API_KEY env, or --set-default-api-key");
+      console.error("Error: No API key. Set via --api-key, TODOFORAI_API_TOKEN env, or log in with `todoforai-cli`");
       process.exit(1);
     }
 
     this.api = new ApiClient(this.apiUrl, apiKey);
 
-    // Enter TUI
-    this.screen.enter();
-    this.setupResize();
+    // ── Boot OpenTUI ──
+    this.renderer = await createCliRenderer({
+      exitOnCtrlC: false,
+      useAlternateScreen: true,
+      useMouse: false,
+    });
 
-    // Clean exit handler
-    const cleanup = () => {
-      this.screen.exit();
-    };
-    process.on("exit", cleanup);
-    process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+    const mainBox = new BoxRenderable(this.renderer, {
+      id: "main",
+      flexGrow: 1,
+      maxHeight: "100%",
+      maxWidth: "100%",
+      flexDirection: "column",
+    });
+    this.renderer.root.add(mainBox);
+
+    this.status = new StatusBar(this.renderer, mainBox);
+    this.output = new OutputBuffer(this.renderer, mainBox);
+    this.input = new InputBar(this.renderer, mainBox);
+
+    this.setupGlobalKeys();
+    this.renderer.start();
+
+    process.on("exit", () => this.cleanup());
+    process.on("SIGTERM", () => { this.cleanup(); process.exit(0); });
 
     try {
-      // Populate status bar from config defaults immediately
-      if (this.cfg.data.default_agent_name) {
-        this.status.agentName = this.cfg.data.default_agent_name;
+      if (this.cfgScope.data.default_agent_name) {
+        this.status.agentName = this.cfgScope.data.default_agent_name;
       }
 
-      // Show logo + tip in output
       for (const line of renderLogo()) {
         this.output.appendLine(`  ${line}`);
       }
@@ -378,17 +393,21 @@ class TuiApp {
       this.output.appendLine("");
 
       this.status.connected = false;
-      this.redraw();
+      this.status.render();
 
-      // Connect WS
       this.ws = new FrontendWebSocket(this.apiUrl, apiKey);
       await this.ws.connect();
       this.status.connected = true;
+      this.status.render();
 
       // ── Resume mode ──
       if (args.resume || args.continue) {
-        const todoId = (args.resume as string) || this.cfg.data.last_todo_id;
-        if (!todoId) { this.output.appendLine(`${RED}Error: No recent todo found${RESET}`); this.output.render(); await this.waitForExit(); return; }
+        const todoId = (args.resume as string) || this.cfgScope.data.last_todo_id;
+        if (!todoId) {
+          this.output.appendLine(`${RED}Error: No recent todo found${RESET}`);
+          await this.waitForExit();
+          return;
+        }
 
         const todo = await this.api.getTodo(todoId);
         this.todoId = todoId;
@@ -398,24 +417,25 @@ class TuiApp {
         this.status.agentName = getDisplayName(this.agent);
         const resumePaths = getAgentWorkspacePaths(this.agent);
         if (resumePaths.length) {
-          this.status.agentPath = resumePaths.length === 1 ? formatPathWithTilde(resumePaths[0]) : JSON.stringify(resumePaths.map(formatPathWithTilde));
+          this.status.agentPath = resumePaths.length === 1
+            ? formatPathWithTilde(resumePaths[0])
+            : JSON.stringify(resumePaths.map(formatPathWithTilde));
         }
 
-        // Display existing messages
         for (const msg of todo.messages || []) {
           const role = msg.role === "user" ? `${CYAN}You${RESET}` : `${GREEN}AI${RESET}`;
           this.output.appendLine(`${role}: ${(msg.content || "").slice(0, 200)}`);
         }
         this.output.appendLine(`${DIM}${"─".repeat(40)}${RESET}`);
         this.output.appendLine(`${DIM}Resumed todo: ${todoId}${RESET}`);
-        this.redraw();
+        this.status.render();
 
         await this.interactiveLoop();
         await this.ws.close();
         return;
       }
 
-      // ── Pre-resolve agent (always try path, like CLI) ──
+      // ── Pre-resolve agent ──
       let preMatchedAgent: any = null;
 
       if (args.agent) {
@@ -424,56 +444,49 @@ class TuiApp {
           preMatchedAgent = matches[0];
         } else {
           this.output.appendLine(`${RED}Error: Agent '${args.agent}' not found${RESET}`);
-          this.output.render();
           await this.waitForExit();
           return;
         }
-        this.cfg.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
+        this.cfgScope.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
       } else {
-        // Always resolve from --path (defaults to "."/cwd), same as CLI
         const pathArg = (args.path as string) || ".";
         const resolved = realpathSync(resolve(pathArg));
         const matches = await this.api.listAgentSettings({ workspacePath: resolved });
         if (matches.length > 0) {
           preMatchedAgent = matches[0];
-          this.cfg.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
+          this.cfgScope.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
         } else if (pathArg !== ".") {
-          // Explicit non-cwd path with no match — auto-create
-          this.output.appendLine(`${DIM}No agent for '${formatPathWithTilde(resolved)}', creating...${RESET}`);
-          this.output.render();
+          this.output.appendLine(`${DIM}No agent for '${formatPathWithTilde(resolved)}', creating…${RESET}`);
           preMatchedAgent = await autoCreateAgent(this.api, resolved);
-          this.cfg.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
+          this.cfgScope.setDefaultAgent(getDisplayName(preMatchedAgent), preMatchedAgent);
         }
       }
 
       if (preMatchedAgent) {
         this.status.agentName = getDisplayName(preMatchedAgent);
         const paths = getAgentWorkspacePaths(preMatchedAgent);
-        const pathStr = paths.length === 1 ? formatPathWithTilde(paths[0]) : JSON.stringify(paths.map(formatPathWithTilde));
-        this.status.agentPath = pathStr;
+        this.status.agentPath = paths.length === 1
+          ? formatPathWithTilde(paths[0])
+          : JSON.stringify(paths.map(formatPathWithTilde));
       }
-
-      this.redraw();
+      this.status.render();
 
       // ── Read content ──
       let content: string;
       if (positionals.length > 0) {
         content = positionals.join(" ");
       } else if (!process.stdin.isTTY) {
-        // Piped stdin
         const chunks: Buffer[] = [];
         for await (const chunk of process.stdin) chunks.push(chunk);
         content = Buffer.concat(chunks).toString("utf-8").trim();
         if (!content) {
           this.output.appendLine(`${RED}Error: Empty input${RESET}`);
-          this.output.render();
           await this.waitForExit();
           return;
         }
       } else {
-        // Interactive: read from input bar
         this.output.appendLine(`${DIM}Type your message below, or /exit to quit.${RESET}`);
-        this.redraw();
+        this.status.render();
         const { promise } = this.input.read();
         content = await promise;
         if (!content || ["/exit", "/quit", "/q"].includes(content)) {
@@ -483,8 +496,8 @@ class TuiApp {
       }
 
       // ── Select project + agent ──
-      const hasProject = args.project || this.cfg.data.default_project_id;
-      const storedAgent = this.cfg.data.default_agent_settings;
+      const hasProject = args.project || this.cfgScope.data.default_project_id;
+      const storedAgent = this.cfgScope.data.default_agent_settings;
       const hasAgent = preMatchedAgent || (storedAgent?.id && !args.agent);
 
       let projects: any[] | null = null;
@@ -494,18 +507,16 @@ class TuiApp {
         if (!hasAgent) agents = await this.api.listAgentSettings();
       }
 
-      // Project
       if (args.project) {
         this.projectId = args.project as string;
-      } else if (this.cfg.data.default_project_id && !projects) {
-        this.projectId = this.cfg.data.default_project_id;
+      } else if (this.cfgScope.data.default_project_id && !projects) {
+        this.projectId = this.cfgScope.data.default_project_id;
       } else {
         const sel = await this.selectProject(projects!);
         this.projectId = sel.id;
-        this.cfg.setDefaultProject(sel.id, sel.name);
+        this.cfgScope.setDefaultProject(sel.id, sel.name);
       }
 
-      // Agent
       if (preMatchedAgent) {
         this.agent = preMatchedAgent;
       } else if (storedAgent?.id && !agents.length) {
@@ -517,57 +528,55 @@ class TuiApp {
       if (!this.status.agentPath) {
         const paths = getAgentWorkspacePaths(this.agent);
         if (paths.length) {
-          this.status.agentPath = paths.length === 1 ? formatPathWithTilde(paths[0]) : JSON.stringify(paths.map(formatPathWithTilde));
+          this.status.agentPath = paths.length === 1
+            ? formatPathWithTilde(paths[0])
+            : JSON.stringify(paths.map(formatPathWithTilde));
         }
       }
-      this.redraw();
+      if (args.model) this.agent = { ...this.agent, model: args.model };
+      this.status.agentModel = (args.model as string) || this.agent.model || "";
+      this.status.render();
 
       // ── Create todo ──
       this.output.appendLine(`\n${CYAN}You:${RESET} ${content}`);
       this.output.appendLine(`${DIM}${"─".repeat(40)}${RESET}`);
-      this.output.render();
 
       const todo = await this.api.addMessage(this.projectId, content, this.agent);
       this.todoId = todo.id || crypto.randomUUID();
-      this.cfg.data.last_todo_id = this.todoId;
-      this.cfg.save();
+      this.cfgScope.setLastTodoId(this.todoId);
 
-      const frontendUrl = getFrontendUrl(this.apiUrl, this.projectId, this.todoId);
+      const frontendUrl = getFrontendUrl(this.apiUrl, this.todoId);
       this.output.appendLine(`${DIM}TODO:${RESET} ${CYAN}${frontendUrl}${RESET}`);
-      this.redraw();
+      this.status.render();
 
-      // ── Watch ──
       await this.watch();
 
-      // ── Interactive follow-up ──
       this.output.appendLine(`${DIM}${"─".repeat(40)}${RESET}`);
-      this.output.render();
       await this.interactiveLoop();
 
       await this.ws.close();
     } catch (e: any) {
-      this.output.appendLine(`${RED}Error: ${e.message}${RESET}`);
-      this.output.render();
+      this.output?.appendLine(`${RED}Error: ${e.message}${RESET}`);
       await this.waitForExit();
     }
   }
 
   cleanup(): void {
-    if (this.screen.entered) this.screen.exit();
+    if (this.renderer && !this.renderer.isDestroyed) {
+      this.renderer.destroy();
+    }
+    this.ws?.close().catch(() => {});
   }
 
-  /** Wait for any key to exit (used for error states) */
   private waitForExit(): Promise<void> {
-    this.output.appendLine(`${DIM}Press any key to exit...${RESET}`);
-    this.output.render();
+    this.output?.appendLine(`${DIM}Press any key to exit…${RESET}`);
     return new Promise(resolve => {
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.once("data", () => {
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
+      const handler = (_seq: string) => {
+        this.renderer!.removeInputHandler(handler);
         resolve();
-      });
+        return true;
+      };
+      this.renderer!.prependInputHandler(handler);
     });
   }
 }
@@ -576,7 +585,6 @@ class TuiApp {
 
 const app = new TuiApp();
 app.run().catch(e => {
-  // Ensure alt buffer is exited even on crash
   app.cleanup();
   process.stderr.write(`Error: ${e.message}\n`);
   process.exit(1);

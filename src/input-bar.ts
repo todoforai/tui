@@ -1,245 +1,145 @@
 /**
- * InputBar — multiline input in fixed bottom region.
- * Renders prompt + buffer in the input region of the screen.
- * Raw mode key handling with bracketed paste support.
+ * InputBar — multi-line input using OpenTUI TextareaRenderable.
+ * Enter = submit, Alt+Enter = newline, max 5 lines.
  */
+import {
+  BoxRenderable, TextRenderable, TextareaRenderable,
+  StyledText, fg, bold, dim,
+} from "@opentui/core";
+import type { CliRenderer } from "@opentui/core";
 
-import { Screen } from "./screen";
-import { BRIGHT_WHITE, RESET, DIM } from "./colors";
-
-const SEP_CHAR = "─";
+const BRAND = "#f96e2e";
+const str = (s: string): any => ({ __isChunk: true, text: s });
 
 export class InputBar {
-  private screen: Screen;
-  private buf = "";
-  private cursor = 0;
-  private pasting = false;
-  private done = false;
-  private resolveFn: ((value: string) => void) | null = null;
-  private rejectFn: ((err: Error) => void) | null = null;
-  private dataHandler: ((data: Buffer) => void) | null = null;
-  prompt = `${BRIGHT_WHITE}TODO>${RESET} `;
-  private promptLen = 6; // visible length of "TODO> " (5 chars + space)
+  private box: BoxRenderable;
+  private sepText: TextRenderable;
+  private inputField: TextareaRenderable;
+  private statusText: TextRenderable;
+
   enabled = false;
+  /** Called when the user cancels (Ctrl+C during input) */
+  triggerCancel: (() => void) | null = null;
 
-  constructor(screen: Screen) {
-    this.screen = screen;
-  }
-
-  /** Start accepting input. Returns promise that resolves with the input text. */
-  read(): { promise: Promise<string>; cancel: () => void } {
-    this.buf = "";
-    this.cursor = 0;
-    this.pasting = false;
-    this.done = false;
-    this.enabled = true;
-
-    let cancelFn: () => void = () => {};
-
-    const promise = new Promise<string>((resolve, reject) => {
-      this.resolveFn = resolve;
-      this.rejectFn = reject;
-      cancelFn = () => this.finish(true);
-
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdout.write("\x1b[?2004h"); // enable bracketed paste
-
-      this.dataHandler = (data: Buffer) => this.onData(data);
-      process.stdin.on("data", this.dataHandler);
-      this.render();
+  constructor(renderer: CliRenderer, container: BoxRenderable) {
+    this.box = new BoxRenderable(renderer, {
+      id: "input-bar",
+      width: "100%",
+      flexDirection: "column",
+      flexShrink: 0,
+      backgroundColor: "#1e1e2e",
     });
 
-    return { promise, cancel: cancelFn };
+    // Separator line
+    const sepBox = new BoxRenderable(renderer, {
+      id: "input-sep",
+      height: 1,
+      width: "100%",
+      backgroundColor: "#313244",
+    });
+    this.sepText = new TextRenderable(renderer, { id: "sep-text", content: "" });
+    sepBox.add(this.sepText);
+    this.box.add(sepBox);
+
+    // Input row
+    const inputRow = new BoxRenderable(renderer, {
+      id: "input-row",
+      flexDirection: "row",
+      width: "100%",
+      paddingLeft: 1,
+      paddingRight: 1,
+    });
+
+    const prompt = new TextRenderable(renderer, {
+      id: "input-prompt",
+      content: new StyledText([bold(fg(BRAND)("TODO›")), str(" ")]),
+      flexShrink: 0,
+    });
+
+    this.inputField = new TextareaRenderable(renderer, {
+      id: "input-field",
+      flexGrow: 1,
+      minHeight: 1,
+      maxHeight: 5,
+      wrapMode: "word",
+      placeholder: "type a message…",
+      keyBindings: [
+        { name: "return", action: "submit" },
+        { name: "return", meta: true, action: "newline" },
+      ],
+    });
+
+    inputRow.add(prompt);
+    inputRow.add(this.inputField);
+    this.box.add(inputRow);
+
+    // Status line (shown when disabled)
+    const statusRow = new BoxRenderable(renderer, {
+      id: "status-row",
+      height: 1,
+      width: "100%",
+      paddingLeft: 1,
+    });
+    this.statusText = new TextRenderable(renderer, { id: "status-text-input", content: "" });
+    statusRow.add(this.statusText);
+    this.box.add(statusRow);
+
+    container.add(this.box);
   }
 
-  private finish(cancelled: boolean): void {
-    if (this.done) return;
-    this.done = true;
-    this.enabled = false;
-    process.stdout.write("\x1b[?2004l"); // disable bracketed paste
-    process.stdin.setRawMode(false);
-    process.stdin.pause();
-    if (this.dataHandler) {
-      process.stdin.removeListener("data", this.dataHandler);
-      this.dataHandler = null;
-    }
-    if (cancelled) this.rejectFn?.(new Error("cancelled"));
-    else this.resolveFn?.(this.buf.trim());
+  read(): { promise: Promise<string>; cancel: () => void } {
+    this.enabled = true;
+    this.inputField.setText("");
+    this.inputField.focus();
+    this.statusText.content = "";
+
+    let resolveFn!: (v: string) => void;
+    let rejectFn!: (e: Error) => void;
+
+    const promise = new Promise<string>((res, rej) => {
+      resolveFn = res;
+      rejectFn = rej;
+    });
+
+    const onSubmit = () => {
+      this.triggerCancel = null;
+      this.enabled = false;
+      this.inputField.onSubmit = undefined;
+      const text = this.inputField.plainText;
+      this.inputField.setText("");
+      this.inputField.blur();
+      resolveFn(text.trim());
+    };
+
+    this.inputField.onSubmit = onSubmit;
+
+    const cancel = () => {
+      this.triggerCancel = null;
+      this.enabled = false;
+      this.inputField.onSubmit = undefined;
+      this.inputField.setText("");
+      this.inputField.blur();
+      rejectFn(new Error("cancelled"));
+    };
+
+    this.triggerCancel = cancel;
+    return { promise, cancel };
   }
 
-  private onData(data: Buffer): void {
-    let s = data.toString("utf-8");
-    while (s.length > 0 && !this.done) {
-      if (this.pasting) {
-        const end = s.indexOf("\x1b[201~");
-        if (end >= 0) {
-          const text = s.slice(0, end).replace(/\r\n?|\n/g, "\n");
-          this.insert(text);
-          this.pasting = false;
-          s = s.slice(end + 6);
-        } else {
-          this.insert(s.replace(/\r\n?|\n/g, "\n"));
-          s = "";
-        }
-        this.render();
-      } else {
-        const ps = s.indexOf("\x1b[200~");
-        const chunk = ps >= 0 ? s.slice(0, ps) : s;
-
-        for (let i = 0; i < chunk.length && !this.done; i++) {
-          const c = chunk.charCodeAt(i);
-          if (c === 0x03) { this.finish(true); return; }                // Ctrl+C
-          if (c === 0x04) { this.finish(true); return; }                // Ctrl+D
-          if (c === 0x0d || c === 0x0a) { this.finish(false); return; } // Enter
-          if (c === 0x17) { this.deleteWordBack(); }                     // Ctrl+W
-          else if (c === 0x0b) { this.killToEnd(); }                     // Ctrl+K
-          else if (c === 0x7f || c === 0x08) { this.backspace(); }       // Backspace
-          else if (c === 0x1b) {                                         // ESC
-            if (i + 1 < chunk.length && chunk.charCodeAt(i + 1) === 0x0d) {
-              this.insert("\n");
-              i++;
-            } else {
-              i = this.handleCSI(chunk, i) - 1;
-            }
-          }
-          else if (c === 0x01) { this.cursor = 0; }                     // Ctrl+A
-          else if (c === 0x05) { this.cursor = this.buf.length; }       // Ctrl+E
-          else if (c >= 0x20) { this.insert(chunk[i]); }
-        }
-
-        if (ps >= 0) { this.pasting = true; s = s.slice(ps + 6); }
-        else s = "";
-        this.render();
-      }
-    }
+  /** Insert text at the current cursor position (used for Ctrl+V paste) */
+  insertText(text: string): void {
+    if (!this.enabled) return;
+    this.inputField.insertText(text);
   }
 
-  private insert(text: string): void {
-    this.buf = this.buf.slice(0, this.cursor) + text + this.buf.slice(this.cursor);
-    this.cursor += text.length;
-  }
+  render(): void {} // OpenTUI renders automatically
 
-  private backspace(): void {
-    if (this.cursor > 0) {
-      this.buf = this.buf.slice(0, this.cursor - 1) + this.buf.slice(this.cursor);
-      this.cursor--;
-    }
-  }
-
-  private deleteWordBack(): void {
-    let p = this.cursor;
-    while (p > 0 && this.buf[p - 1] === " ") p--;
-    while (p > 0 && this.buf[p - 1] !== " ") p--;
-    this.buf = this.buf.slice(0, p) + this.buf.slice(this.cursor);
-    this.cursor = p;
-  }
-
-  private killToEnd(): void {
-    this.buf = this.buf.slice(0, this.cursor);
-  }
-
-  private wordLeft(): number {
-    let p = this.cursor;
-    while (p > 0 && this.buf[p - 1] === " ") p--;
-    while (p > 0 && this.buf[p - 1] !== " ") p--;
-    return p;
-  }
-
-  private wordRight(): number {
-    let p = this.cursor;
-    while (p < this.buf.length && this.buf[p] === " ") p++;
-    while (p < this.buf.length && this.buf[p] !== " ") p++;
-    return p;
-  }
-
-  private handleCSI(chunk: string, start: number): number {
-    let i = start + 1;
-    if (i >= chunk.length || chunk[i] !== "[") {
-      if (i < chunk.length) i++;
-      return i;
-    }
-    i++;
-    let params = "";
-    while (i < chunk.length && /[0-9;]/.test(chunk[i])) { params += chunk[i]; i++; }
-    const final = i < chunk.length ? chunk[i] : "";
-    i++;
-
-    const parts = params.split(";");
-    const modifier = parts.length > 1 ? parseInt(parts[1]) : 0;
-    const code = parts[0] || "";
-    const ctrl = modifier === 5;
-
-    switch (final) {
-      case "D": // Left
-        if (ctrl) this.cursor = this.wordLeft();
-        else if (this.cursor > 0) this.cursor--;
-        break;
-      case "C": // Right
-        if (ctrl) this.cursor = this.wordRight();
-        else if (this.cursor < this.buf.length) this.cursor++;
-        break;
-      case "H": this.cursor = 0; break;
-      case "F": this.cursor = this.buf.length; break;
-      case "A": break; // Up — ignore in input
-      case "B": break; // Down — ignore in input
-      case "~":
-        if (code === "3" && this.cursor < this.buf.length) {
-          this.buf = this.buf.slice(0, this.cursor) + this.buf.slice(this.cursor + 1);
-        }
-        if (code === "5") { /* PgUp — handled by caller */ }
-        if (code === "6") { /* PgDn — handled by caller */ }
-        break;
-    }
-    return i;
-  }
-
-  /** Render separator lines above and below input */
-  private renderSeparators(): void {
-    const sep = `${DIM}${SEP_CHAR.repeat(this.screen.cols)}${RESET}`;
-    this.screen.writeLine(this.screen.inputSepTop, sep);
-    this.screen.writeLine(this.screen.inputSepBottom, sep);
-  }
-
-  /** Called when input needs a full redraw (e.g. height changed) */
-  onFullRedraw: (() => void) | null = null;
-
-  /** Render the input bar in the bottom region */
-  render(): void {
-    const inputLines = this.buf.split("\n");
-    const needed = Math.max(1, inputLines.length);
-    const prevHeight = this.screen.inputHeight;
-    this.screen.setInputHeight(needed);
-
-    // If input height changed, need full redraw (output area shrank/grew)
-    if (needed !== prevHeight && this.onFullRedraw) {
-      this.onFullRedraw();
-      return; // full redraw already rendered us
-    }
-
-    this.renderSeparators();
-
-    const lines: string[] = [];
-    for (let i = 0; i < inputLines.length; i++) {
-      const prefix = i === 0 ? this.prompt : " ".repeat(this.promptLen);
-      lines.push(prefix + inputLines[i]);
-    }
-
-    this.screen.writeRegion(this.screen.inputTop, this.screen.inputTop + needed - 1, lines);
-
-    // Position cursor: promptLen offset on first line, same on continuations
-    const cursorLines = this.buf.slice(0, this.cursor).split("\n");
-    const cursorRow = cursorLines.length - 1;
-    const textCol = cursorLines[cursorLines.length - 1].length;
-    const cursorCol = this.promptLen + textCol + 1; // +1 for 1-based terminal col
-    this.screen.showCursorAt(this.screen.inputTop + cursorRow, cursorCol);
-  }
-
-  /** Render disabled state (e.g. while watching) */
   renderDisabled(message?: string): void {
-    this.renderSeparators();
-    const text = message || `${DIM}  waiting...${RESET}`;
-    this.screen.writeRegion(this.screen.inputTop, this.screen.inputTop, [text]);
-    this.screen.hideCursor();
+    this.enabled = false;
+    this.inputField.blur();
+    const msg = message ?? "";
+    // Strip ANSI for simple display in status row
+    const plain = msg.replace(/\x1b\[[0-9;]*m/g, "");
+    this.statusText.content = new StyledText([plain ? dim(plain) : dim("waiting…")] as any);
   }
 }

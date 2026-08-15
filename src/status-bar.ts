@@ -1,39 +1,43 @@
 /**
- * StatusBar — 1-line top bar showing agent, path, connection status.
- * Mirrors CLI output: Agent: name │ Path: ~/path
+ * StatusBar — single-row top bar showing connection/agent/model info.
  */
+import { BoxRenderable, TextRenderable, StyledText, fg, bold, dim } from "@opentui/core";
+import type { CliRenderer } from "@opentui/core";
 
-import { Screen } from "./screen";
-import { BRAND, RESET, DIM, GREEN, RED, BG_STATUS, WHITE, CYAN } from "./colors";
+const BRAND = "#f96e2e";
+const str = (s: string): any => ({ __isChunk: true, text: s });
 
 export class StatusBar {
-  private screen: Screen;
-  agentName = "";
-  agentPath = "";
+  private text: TextRenderable;
+
   connected = false;
   watching = false;
+  agentName = "";
+  agentPath = "";
+  agentModel = "";
 
-  constructor(screen: Screen) {
-    this.screen = screen;
+  constructor(renderer: CliRenderer, container: BoxRenderable) {
+    const box = new BoxRenderable(renderer, {
+      id: "status-bar",
+      height: 1,
+      width: "100%",
+      flexShrink: 0,
+      backgroundColor: "#1e1e2e",
+      paddingLeft: 1,
+      paddingRight: 1,
+    });
+    this.text = new TextRenderable(renderer, { id: "status-text", content: "" });
+    box.add(this.text);
+    container.add(box);
   }
 
   render(): void {
-    const cols = this.screen.cols;
-    const connDot = this.connected ? `${GREEN}●${RESET}${BG_STATUS}` : `${RED}●${RESET}${BG_STATUS}`;
-    const watchLabel = this.watching ? `${DIM}watching${RESET}${BG_STATUS}` : "";
-
-    let bar = `${BG_STATUS}${WHITE}`;
-    bar += ` ${BRAND}todofor.ai${RESET}${BG_STATUS}${WHITE}`;
-    if (this.agentName) bar += ` ${DIM}│${RESET}${BG_STATUS} ${BRAND}${this.agentName}${RESET}${BG_STATUS}`;
-    if (this.agentPath) bar += ` ${DIM}│${RESET}${BG_STATUS} ${CYAN}${this.agentPath}${RESET}${BG_STATUS}`;
-    if (watchLabel) bar += ` ${DIM}│${RESET}${BG_STATUS} ${watchLabel}`;
-    bar += ` ${connDot}`;
-
-    // Pad to fill width
-    const visLen = bar.replace(/\x1b\[[0-9;]*m/g, "").length;
-    if (visLen < cols) bar += " ".repeat(cols - visLen);
-
-    bar += RESET;
-    this.screen.writeLine(this.screen.statusRow, bar);
+    const chunks: any[] = [bold(fg(BRAND)("todoai")), str(" ")];
+    chunks.push(this.connected ? fg("#a6e3a1")("●") : fg("#f38ba8")("○"));
+    if (this.agentName) chunks.push(dim(" │ "), fg("#cdd6f4")(this.agentName));
+    if (this.agentPath) chunks.push(dim(" " + this.agentPath));
+    if (this.agentModel) chunks.push(dim(" [" + this.agentModel + "]"));
+    if (this.watching) chunks.push(dim(" │ "), fg("#f9e2af")("working…"));
+    this.text.content = new StyledText(chunks);
   }
 }

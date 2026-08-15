@@ -1,164 +1,120 @@
 /**
- * OutputBuffer — scrollable line buffer for the output region.
- * Supports PgUp/PgDn scrolling, ring buffer for memory.
+ * OutputBuffer — wraps ScrollBoxRenderable for scrollable streaming output.
+ * stickyScroll: true keeps the view pinned to the bottom automatically;
+ * user can scroll up to review history, scroll down to re-pin.
  */
+import { BoxRenderable, TextRenderable } from "@opentui/core";
+import { ScrollBoxRenderable } from "@opentui/core";
+import type { CliRenderer } from "@opentui/core";
+import { ansiToStyled } from "./ansi-to-styled";
 
-import { Screen } from "./screen";
-import { RESET, DIM } from "./colors";
-
-const MAX_LINES = 10000;
-
-/** Strip ANSI to get visible length */
-function visibleLen(s: string): number {
-  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
-}
-
-/** Wrap a line to fit within cols, preserving ANSI codes */
-function wrapLine(line: string, cols: number): string[] {
-  if (cols <= 0) return [line];
-  const result: string[] = [];
-  let current = "";
-  let visible = 0;
-  let i = 0;
-
-  while (i < line.length) {
-    if (line[i] === "\x1b") {
-      const end = line.indexOf("m", i);
-      if (end !== -1) {
-        current += line.slice(i, end + 1);
-        i = end + 1;
-        continue;
-      }
-    }
-    if (visible >= cols) {
-      result.push(current);
-      current = "";
-      visible = 0;
-    }
-    current += line[i];
-    visible++;
-    i++;
-  }
-  if (current || result.length === 0) result.push(current);
-  return result;
-}
+const MAX_LINES = 5000;
 
 export class OutputBuffer {
-  private lines: string[] = [];
-  private _scrollOffset = 0; // 0 = bottom (auto-scroll), >0 = scrolled up
-  private screen: Screen;
-  private dirty = false;
-  /** Accumulated partial line (no trailing newline yet) */
+  readonly scrollBox: ScrollBoxRenderable;
+  private lines: TextRenderable[] = [];
   private partial = "";
+  private partialNode: TextRenderable | null = null;
+  private renderer: CliRenderer;
 
-  constructor(screen: Screen) {
-    this.screen = screen;
+  constructor(renderer: CliRenderer, container: BoxRenderable) {
+    this.renderer = renderer;
+    this.scrollBox = new ScrollBoxRenderable(renderer, {
+      id: "output-scroll",
+      stickyScroll: true,
+      stickyStart: "bottom",
+      scrollY: true,
+      scrollX: false,
+      flexGrow: 1,
+      scrollbarOptions: {
+        trackOptions: { foregroundColor: "#585b70", backgroundColor: "#1e1e2e" },
+      },
+      contentOptions: { paddingLeft: 1 },
+    });
+    container.add(this.scrollBox);
   }
 
-  get lineCount(): number { return this.lines.length; }
-  get scrollOffset(): number { return this._scrollOffset; }
-  get isAtBottom(): boolean { return this._scrollOffset === 0; }
+  private addRenderable(node: TextRenderable) {
+    this.scrollBox.add(node);
+    this.lines.push(node);
+    if (this.lines.length > MAX_LINES) {
+      const old = this.lines.shift()!;
+      this.scrollBox.remove(old.id);
+      old.destroy();
+    }
+  }
 
-  /** Append text (may contain newlines, partial lines buffered) */
+  private newLineNode(text: string): TextRenderable {
+    return new TextRenderable(this.renderer, {
+      id: `line-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      content: ansiToStyled(text),
+      width: "100%",
+    });
+  }
+
+  /** Append streaming text (may have embedded newlines) */
   append(text: string): void {
     if (!text) return;
     const combined = this.partial + text;
     const parts = combined.split("\n");
-    // Last element is the new partial (empty string if text ended with \n)
     this.partial = parts.pop()!;
 
     for (const line of parts) {
-      this.lines.push(line);
-      if (this.lines.length > MAX_LINES) {
-        this.lines.shift();
-        if (this._scrollOffset > 0) this._scrollOffset--;
+      if (this.partialNode) {
+        // Finalize the partial node with the completed line
+        this.partialNode.content = ansiToStyled(line);
+        this.partialNode = null;
+      } else {
+        this.addRenderable(this.newLineNode(line));
       }
     }
-    this.dirty = true;
+
+    // Update/create partial node for remaining text
+    if (this.partial) {
+      if (!this.partialNode) {
+        this.partialNode = this.newLineNode(this.partial);
+        this.addRenderable(this.partialNode);
+      } else {
+        this.partialNode.content = ansiToStyled(this.partial);
+      }
+    }
   }
 
-  /** Flush partial line as a complete line */
+  /** Flush any partial line */
   flushPartial(): void {
-    if (this.partial) {
-      this.lines.push(this.partial);
+    if (this.partial || this.partialNode) {
+      this.partialNode = null;
       this.partial = "";
-      if (this.lines.length > MAX_LINES) this.lines.shift();
-      this.dirty = true;
     }
   }
 
   /** Append a complete line */
   appendLine(line: string): void {
     this.flushPartial();
-    this.lines.push(line);
-    if (this.lines.length > MAX_LINES) {
-      this.lines.shift();
-      if (this._scrollOffset > 0) this._scrollOffset--;
-    }
-    this.dirty = true;
+    this.addRenderable(this.newLineNode(line));
   }
 
-  scrollUp(n?: number): void {
-    const pageSize = n ?? this.screen.outputHeight;
-    this._scrollOffset += pageSize;
-    const maxScroll = Math.max(0, this.getWrappedLines().length - this.screen.outputHeight);
-    if (this._scrollOffset > maxScroll) this._scrollOffset = maxScroll;
-    this.dirty = true;
+  scrollUp(): void {
+    // Disable sticky so it doesn't snap back after manual scroll
+    this.scrollBox.stickyScroll = false;
+    this.scrollBox.scrollBy(-1, "viewport");
   }
 
-  scrollDown(n?: number): void {
-    const pageSize = n ?? this.screen.outputHeight;
-    this._scrollOffset -= pageSize;
-    if (this._scrollOffset < 0) this._scrollOffset = 0;
-    this.dirty = true;
+  scrollDown(): void {
+    this.scrollBox.scrollBy(1, "viewport");
+    const viewportHeight = (this.scrollBox as any).viewport?.height ?? 0;
+    const atBottom = this.scrollBox.scrollTop >= this.scrollBox.scrollHeight - viewportHeight - 2;
+    if (atBottom) this.scrollBox.stickyScroll = true;
   }
 
   scrollToBottom(): void {
-    this._scrollOffset = 0;
-    this.dirty = true;
+    // Re-enable sticky — next content addition will pin to bottom
+    this.scrollBox.stickyScroll = true;
+    const viewportHeight = (this.scrollBox as any).viewport?.height as number | undefined;
+    const max = Math.max(0, this.scrollBox.scrollHeight - (viewportHeight ?? 0));
+    if (max > 0) this.scrollBox.scrollTop = max;
   }
 
-  /** Get all lines wrapped to screen width */
-  private getWrappedLines(): string[] {
-    const cols = this.screen.cols;
-    const wrapped: string[] = [];
-    for (const line of this.lines) {
-      wrapped.push(...wrapLine(line, cols));
-    }
-    // Include partial line if any
-    if (this.partial) {
-      wrapped.push(...wrapLine(this.partial, cols));
-    }
-    return wrapped;
-  }
-
-  /** Render the output region */
-  render(force = false): void {
-    if (!this.dirty && !force) return;
-    this.dirty = false;
-
-    const height = this.screen.outputHeight;
-    const wrapped = this.getWrappedLines();
-    const total = wrapped.length;
-
-    // Calculate visible window
-    const endIdx = total - this._scrollOffset;
-    const startIdx = Math.max(0, endIdx - height);
-
-    const visible = wrapped.slice(startIdx, endIdx);
-
-    // Pad to fill region
-    const displayLines: string[] = [];
-    for (let i = 0; i < height; i++) {
-      displayLines.push(i < visible.length ? visible[i] : "");
-    }
-
-    this.screen.writeRegion(this.screen.outputTop, this.screen.outputBottom, displayLines);
-
-    // Show scroll indicator if not at bottom
-    if (this._scrollOffset > 0) {
-      const indicator = `${DIM} ↑ ${this._scrollOffset} lines above ↑${RESET}`;
-      this.screen.writeLine(this.screen.outputTop, indicator);
-    }
-  }
+  /** No-op — OpenTUI renders automatically */
+  render(_force = false): void {}
 }
