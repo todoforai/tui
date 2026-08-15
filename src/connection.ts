@@ -2,9 +2,8 @@
  * Connection — API + WebSocket setup, extracted from CLI main.
  */
 
-import { ApiClient } from "todoforai-edge/src/api";
-import { FrontendWebSocket } from "todoforai-edge/src/frontend-ws";
-import { normalizeApiUrl } from "todoforai-edge/src/config";
+import { ApiClient, FrontendWebSocket } from "@shared/api";
+import { normalizeApiUrl, readCredential } from "@shared/credentials";
 import { ConfigStore } from "todoforai-cli/src/config";
 import { DEFAULT_API_URL, getEnv } from "todoforai-cli/src/args";
 
@@ -24,13 +23,12 @@ export interface Connection {
 export async function createConnection(opts: ConnectionOpts): Promise<Connection> {
   const cfg = new ConfigStore(opts.configPath);
 
-  const apiUrl = normalizeApiUrl(
-    opts.apiUrl || cfg.data.default_api_url || getEnv("API_URL") || DEFAULT_API_URL,
-  );
-  const apiKey = opts.apiKey || cfg.data.default_api_key || getEnv("API_KEY") || "";
+  const apiUrl = normalizeApiUrl(opts.apiUrl || getEnv("API_URL") || DEFAULT_API_URL);
+  // Same priority as the CLI: flag > shared credentials.json > env token.
+  const apiKey = opts.apiKey || readCredential(apiUrl) || getEnv("API_TOKEN") || "";
 
   if (!apiKey) {
-    throw new Error("No API key. Set via --api-key, TODOFORAI_API_KEY env, or --set-default-api-key");
+    throw new Error("No API key. Set via --api-key, TODOFORAI_API_TOKEN env, or log in with `todoforai-cli`");
   }
 
   const api = new ApiClient(apiUrl, apiKey);
