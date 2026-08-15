@@ -3,7 +3,7 @@
  * Renders approval prompts in the output area and captures responses via input bar.
  */
 
-import { FrontendWebSocket } from "todoforai-edge/src/frontend-ws";
+import { FrontendWebSocket } from "@shared/api";
 import { getBlockNewPatterns } from "@shared/fbe/permissionUtils";
 import { renderDiff } from "todoforai-cli/src/diff-view";
 import { OutputBuffer } from "./output";

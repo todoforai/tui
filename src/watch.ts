@@ -3,7 +3,7 @@
  * Same protocol handling, different rendering target.
  */
 
-import { FrontendWebSocket } from "todoforai-edge/src/frontend-ws";
+import { FrontendWebSocket } from "@shared/api";
 import { renderDiff } from "todoforai-cli/src/diff-view";
 import { OutputBuffer } from "./output";
 import { YELLOW, GREEN, RED, DIM, CYAN, RESET } from "./colors";
