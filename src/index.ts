@@ -149,19 +149,29 @@ class TuiApp {
 
   /** Read a single char for approval prompts */
   private singleChar(_prompt: string): Promise<string> {
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
+      const done = (fn: () => void) => {
+        this.renderer!.removeInputHandler(handler);
+        process.stdin.off("end", onEnd);
+        process.stdin.off("error", onEnd);
+        fn();
+      };
+      // Losing stdin must reject, not hang: the caller's catch denies the block,
+      // whereas a pending promise would leave it neither approved nor denied.
+      const onEnd = () => done(() => reject(new Error("stdin closed")));
       const handler = (seq: string) => {
         // Skip multi-char escape sequences (arrows, F-keys, etc.)
         if (seq.length > 1 && seq.startsWith("\x1b")) return false;
-        this.renderer!.removeInputHandler(handler);
         // Enter = accept the default. Every other control key (Ctrl+C, Ctrl+D,
         // ESC) must NOT: callers treat "" as approval, so mapping them to ""
         // would make an interrupt silently allow the action. Return the raw
         // char instead — it matches no choice and therefore denies.
-        if (seq === "\r" || seq === "\n") { resolve(""); return true; }
-        resolve(seq[0].toLowerCase());
+        const ch = seq === "\r" || seq === "\n" ? "" : seq[0].toLowerCase();
+        done(() => resolve(ch));
         return true;
       };
+      process.stdin.once("end", onEnd);
+      process.stdin.once("error", onEnd);
       this.renderer!.prependInputHandler(handler);
     });
   }
