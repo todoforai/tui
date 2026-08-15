@@ -32,19 +32,9 @@ jobs:
         repository: todoforai/cli
         path: cli
 
-    - uses: actions/checkout@v4
-      with:
-        repository: todoforai/edge
-        path: edge
-
-    # Repo layout: tui/, cli/, edge/ — matching the local file: deps
-    # Adjust package.json paths for CI layout
-    - name: Fix local dep paths for CI
-      run: |
-        cd tui
-        sed -i.bak 's|"file:../cli"|"file:../cli"|' package.json
-        sed -i.bak 's|"file:../edge/bun"|"file:../edge/bun"|' package.json
-        rm -f package.json.bak
+    # Repo layout: tui/, cli/, packages/ — matching the local file: deps
+    - name: Checkout shared packages
+      run: git clone --depth 1 https://x-access-token:${{ secrets.GH_PAT }}@github.com/todoforai/packages.git packages
 
     - uses: oven-sh/setup-bun@v2
 
